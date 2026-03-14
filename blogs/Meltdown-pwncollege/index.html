@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meltdown & Page Table Walking | ishaantheguy</title>
+    
+    <link rel="stylesheet" href="../blogs-style.css">
+    
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+
+    <header class="masthead">
+        <div class="masthead-inner">
+            <a href="../index.html" class="site-title">ishaantheguy's blog</a>
+            <nav class="site-nav">
+                <a href="../../index.html">Portfolio</a>
+            </nav>
+        </div>
+    </header>
+
+    <div class="main-container">
+        
+        <aside class="sidebar">
+            <div class="author-profile">
+                <h3 class="author-name">Ishaan Sheth</h3>
+                <p class="author-bio">Third-year engineering student researching system programming and kernel exploitation.</p>
+                
+                <button class="btn-follow">Connect</button>
+                
+                <ul class="author-links">
+                    <li><i class="fas fa-fw fa-map-marker-alt"></i> Mumbai, India</li>
+                    <li><a href="https://github.com/Ishaantheguy"><i class="fab fa-fw fa-github"></i> GitHub</a></li>
+                    <li><a href="https://www.linkedin.com/in/ishaan-sheth-98881a2a1/"><i class="fab fa-fw fa-linkedin"></i> LinkedIn</a></li>
+                </ul>
+            </div>
+        </aside>
+
+        <main class="content-area">
+            
+            <article class="article-body">
+                
+                <header class="article-header">
+                    <h1 class="article-title">Meltdown & Page Table Walking: Because Ring-0 is Just a Suggestion</h1>
+                    <div class="article-meta">
+                        <span><i class="far fa-calendar-alt"></i> March 11, 2026</span>
+                        <span><i class="far fa-folder"></i> kernel, pwn, hardware</span>
+                        <span><i class="fab fa-github"></i> <a href="https://github.com/Ishaantheguy/Meltdown-attack" target="_blank">Source Code</a></span>
+                    </div>
+                </header>
+
+                <p>So, the kernel thinks it's safe. It sits up there in Ring 0, hoarding all the physical memory and hiding behind the MMU, thinking user-space processes are just peasants who can't see past their own virtual address space. Cute.</p>
+
+                <p>Enter <strong>Meltdown</strong>. For this challenge (<code>molten_walk_challenge</code>), we aren't just exploiting a simple buffer overflow. We are exploiting the CPU's own eagerness to please. Modern CPUs are impatient, they execute instructions ahead of time (speculative execution) just in case they need the results. If a permissions check fails, they throw the results away and pretend nothing happened. But they forget to clean up their footprints in the CPU cache.</p>
+
+                <p>Here is how I wrote a C exploit to peer into the kernel's soul, walk its page tables manually, and steal the flag.</p>
+
+                <h4>1. The Shadow Realm (Speculative Execution)</h4>
+                <p>Take a look at the core of the exploit—the inline assembly in <code>speculative_exploit</code>.</p>
+
+<pre><code>void speculative_exploit(size_t target_addr, char *com_buffer)
+{
+    asm volatile(
+        ".intel_syntax noprefix\n"
+        "xor rcx, rcx\n"
+        "lea rbx,[%1]\n"
+        "mov rax, 0x1337\n"
+        "push rax\n"
+        "fild QWORD PTR [rsp]\n"
+        "fsqrt\n"             // Stall the CPU arithmetic unit
+        "fistp QWORD PTR [rsp]\n"
+        "pop rax\n"
+        "mov rax, [rax]\n"    // SEGFAULT
+        "mov cl, BYTE PTR [%0]\n"
+        "shl rcx, 12\n"       // Multiply by 4096 (cache line size)
+        "add rbx, rcx\n"
+        "mov rbx, [rbx]\n"    // Cache the offset
+        ".att_syntax prefix\n"
+        :
+        : "r" (target_addr), "r" (com_buffer)
+        : "rcx", "rbx", "rax","rsp","memory"
+    );
+}</code></pre>
+
+                <p>We want to read a kernel address. The moment we do <code>mov rax, [rax]</code> on an unauthorized address, the CPU triggers a Page Fault (SIGSEGV) and the kernel kills us. But <em>speculatively</em>, the CPU keeps executing the next few lines for a split second.</p>
+                
+                <p>To widen this "speculative window", I fed the CPU a slow floating-point square root operation (<code>fsqrt</code>). While the CPU's arithmetic unit is sweating over the math, our speculative execution races ahead: it reads the secret byte, multiplies it by 4096, and touches our user-space <code>com_buffer</code>. By the time the CPU realizes we shouldn't have access and throws the Segfault, the damage is done. The secret byte has been encoded into the CPU cache. To survive the Segfault, I set up a signal handler that catches <code>SIGSEGV</code> and yeets us safely back to the main loop using <code>longjmp</code>.</p>
+
+                <h4>2. Reading the Tea Leaves (Flush + Reload)</h4>
+                <p>Before triggering the exploit, <code>pre_work()</code> flushes our entire probe buffer from the cache using <code>_mm_clflush</code>. After the speculative execution hits, <code>post_work()</code> steps in. It iterates through every page in the buffer and times how long it takes to read it using the <code>__rdtsc()</code> cycle counter. If a read takes less than ~200 cycles, it means it was in the cache!</p>
+
+                <h4>3. Doing the MMU's Job For It</h4>
+                <p>Having arbitrary read is great, but virtual memory is a maze. The challenge required reading a specific user-space buffer (<code>0x404060</code>), but from the kernel's physical perspective. To do this, I had to manually walk the 4-level x86 page tables, effectively doing the hardware Memory Management Unit's job in C.</p>
+
+<pre><code>long page_translation(long entry)
+{
+    long page = entry & ~0xfff;
+    char arr[8] = {0};
+    arr[7] = 0xff;
+    arr[6] = 0xff;
+    arr[5] = 0x88;
+    arr[4] = 0x80;
+    for(int i=0; i&lt;4; i++) {
+        arr[3-i] = page &gt;&gt; ((3-i)*8) & 0x000000ff;
+    }
+    return *(long *)arr;
+}</code></pre>
+
+                <p>First, I used an <code>ioctl</code> to leak the base address. Then, I read the <code>task_struct</code> to find the <code>mm_struct</code> (offset 992) and extracted the <code>pgd</code> (Page Global Directory) at offset <code>0x50</code>. From there, I manually extracted the index for the PGD, PUD, PMD, and PTE, speculatively read the page table entries, and masked out the metadata flags to get the physical base address of the next table.</p>
+<pre><code>Hierarchy of the page page tables
+
+    PGD -> PUD -> PMD -> PTE
+
+</code></pre>
+                <h4>4. The Grand Finale</h4>
+                <p>After crawling through four levels of page tables using purely speculative execution side-channels, we finally resolve the physical address of <code>0x404060</code>. I added the <code>0x60</code> offset, pointed our Meltdown read primitive at it, and looped it 61 times to leak the flag string byte by byte.</p>
+
+                <p>Turns out, CPU optimizations are the ultimate security vulnerability.</p>
+
+            </article>
+
+        </main>
+    </div>
+
+    <footer class="site-footer">
+        <div class="footer-links">
+            <a href="https://github.com/Ishaantheguy"><i class="fab fa-fw fa-github"></i></a>
+            <a href="https://www.linkedin.com/in/ishaan-sheth-98881a2a1/"><i class="fab fa-fw fa-linkedin"></i></a>
+        </div>
+        <div class="footer-copyright">
+            &copy; 2026 Ishaan Sheth. Ishaantheguy.
+        </div>
+    </footer>
+<script src="../script.js"></script>
+</body>
+</html>
